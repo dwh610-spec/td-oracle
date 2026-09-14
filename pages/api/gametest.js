@@ -95,67 +95,51 @@ export default async function handler(req, res) {
         };
       } catch (e) { out.steps.roster = { error: e.name==="AbortError"?"timeout":e.message }; }
 
-      // ── Step 3: gamelog shape (THE prime suspect — usage/TD parsing) ──────
-      // Use the sample athlete found above.
+      // ── Step 3: season-scoped player stats (current + prior-season fallback) ──
       const sampleId = out.steps.roster?.sampleAthlete?.id;
       if (sampleId) {
-        try {
-          const r = await fetchT(`${WEB}/athletes/${sampleId}/gamelog`);
-          const d = await r.json();
-          out.steps.gamelog = {
-            httpStatus: r.status,
-            player: out.steps.roster.sampleAthlete.name,
-            topKeys: keysOf(d),
-            hasSeasonTypes: !!d.seasonTypes,
-            hasEvents: !!d.events,
-            labels: d.labels || d.names || null,
-            // Show one stat row so we can map indices → stats correctly.
-            sampleRow: extractSampleRow(d),
-            categoriesShape: d.seasonTypes?.[0] ? keysOf(d.seasonTypes[0]) : null
-          };
-        } catch (e) { out.steps.gamelog = { error: e.name==="AbortError"?"timeout":e.message }; }
+        const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
+        const yr = new Date().getFullYear();
+        const testStats = async (y) => {
+          try {
+            const r = await fetchT(`${CORE}/seasons/${y}/types/2/athletes/${sampleId}/statistics`);
+            if (!r.ok) return { year:y, httpStatus:r.status, ok:false };
+            const d = await r.json();
+            const cats = d.splits?.categories || [];
+            return {
+              year: y, httpStatus: r.status,
+              categoryNames: cats.map(c => c.name).slice(0,12),
+              rushingStats: (cats.find(c=>(c.name||"").toLowerCase()==="rushing")?.stats||[]).map(s=>s.name).slice(0,15),
+              sampleRushTD: (cats.find(c=>(c.name||"").toLowerCase()==="rushing")?.stats||[]).find(s=>(s.name||"").toLowerCase()==="rushingtouchdowns")?.value
+            };
+          } catch(e) { return { year:y, error: e.name==="AbortError"?"timeout":e.message }; }
+        };
+        out.steps.playerStats = {
+          player: out.steps.roster.sampleAthlete.name,
+          current: await testStats(yr),
+          prior: await testStats(yr - 1)
+        };
       }
 
-      // ── Step 4: team defense/statistics shape ─────────────────────────────
+      // ── Step 4: season-scoped team defense ────────────────────────────────
       try {
-        const r = await fetchT(`${SITE}/teams/${homeId}/statistics`);
-        const d = await r.json();
-        out.steps.defense = {
-          httpStatus: r.status,
-          topKeys: keysOf(d),
-          hasSplits: !!d.splits,
-          categoryNames: (d.splits?.categories || d.categories || []).map(c => c.name || c.displayName).slice(0,20)
+        const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
+        const yr = new Date().getFullYear();
+        const testDef = async (y) => {
+          const r = await fetchT(`${CORE}/seasons/${y}/types/2/teams/${homeId}/statistics`);
+          if (!r.ok) return { year:y, httpStatus:r.status };
+          const d = await r.json();
+          const cats = d.splits?.categories || [];
+          return { year:y, httpStatus:r.status, categoryNames: cats.map(c=>c.name).slice(0,15) };
         };
+        out.steps.defense = { current: await testDef(yr), prior: await testDef(yr-1) };
       } catch (e) { out.steps.defense = { error: e.name==="AbortError"?"timeout":e.message }; }
     }
 
-    out.VERDICT = "Check: (1) picked.oddsSample — do spread/overUnder/details exist? (2) roster.groupKeys + sampleAthlete — are skill players found? (3) gamelog.labels + sampleRow — THIS is what our usage parser needs; if labels is null the parser can't map stats. (4) defense.categoryNames — do TD-allowed stats exist?";
+    out.VERDICT = "Check playerStats.current vs playerStats.prior — in Week 1 current will be empty and prior (last season) should have rushing/receiving categories with TD values. If prior has categoryNames incl 'rushing'/'receiving' and a sampleRushTD number, the usage parser works. defense.prior.categoryNames should include scoring/defensive categories.";
     return res.status(200).json(out);
   } catch (e) {
     out.fatal = e.message;
     return res.status(200).json(out);
   }
-}
-
-// Try to pull one representative stat row out of whatever gamelog shape ESPN
-// returned, so we can see the actual numbers and their order.
-function extractSampleRow(d) {
-  try {
-    if (d.seasonTypes) {
-      for (const st of d.seasonTypes) {
-        for (const cat of st.categories || []) {
-          for (const ev of cat.events || []) {
-            if (ev.stats && ev.stats.length) return { via:"seasonTypes", stats: ev.stats };
-          }
-        }
-      }
-    }
-    if (d.events && typeof d.events === "object") {
-      for (const k of Object.keys(d.events)) {
-        const ev = d.events[k];
-        if (ev && ev.stats && ev.stats.length) return { via:"events", key:k, stats: ev.stats };
-      }
-    }
-  } catch {}
-  return null;
 }
