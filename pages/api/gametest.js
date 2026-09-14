@@ -95,38 +95,34 @@ export default async function handler(req, res) {
         };
       } catch (e) { out.steps.roster = { error: e.name==="AbortError"?"timeout":e.message }; }
 
-      // ── Step 3: find the working player-stats endpoint. Test a KNOWN STAR
-      // (not the obscure sample athlete, who may have no stats) across several
-      // candidate endpoints so we can see which actually returns TD data. ──
-      // Patrick Mahomes id=3139477; but we want a skill guy — use a known RB:
-      // Bijan Robinson id=4430807 (reliable recent TD producer).
+      // ── Step 3: the overview endpoint won the probe. Dump its FULL stat
+      // structure so we can map the exact fields the usage parser needs. Test
+      // a known RB (Bijan Robinson) who has real TD numbers. ──
       const STAR_ID = "4430807"; // Bijan Robinson
-      const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
       const WEBB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
-      const yr = new Date().getFullYear();
-      const candidates = {
-        overview: `${WEBB}/athletes/${STAR_ID}/overview`,
-        webStats: `${WEBB}/athletes/${STAR_ID}/stats`,
-        splits: `${WEBB}/athletes/${STAR_ID}/splits`,
-        coreStats0: `${CORE}/athletes/${STAR_ID}/statistics/0`,
-        coreSeasonPrior: `${CORE}/seasons/${yr-1}/types/2/athletes/${STAR_ID}/statistics`
-      };
-      const probe = {};
-      for (const [nm, url] of Object.entries(candidates)) {
-        try {
-          const r = await fetchT(url, 6000);
-          const txt = await r.text();
-          let j = null; try { j = JSON.parse(txt); } catch {}
-          probe[nm] = {
-            httpStatus: r.status,
-            topKeys: j ? keysOf(j) : "non-json",
-            // Look for any sign of TD stats in the shape.
-            hasStatistics: !!(j && (j.statistics || j.splits || j.categories)),
-            snippet: txt.slice(0, 180)
-          };
-        } catch (e) { probe[nm] = { error: e.name==="AbortError"?"timeout":e.message }; }
-      }
-      out.steps.playerStatsProbe = { testedPlayer: "Bijan Robinson", candidates: probe };
+      try {
+        const r = await fetchT(`${WEBB}/athletes/${STAR_ID}/overview`, 6000);
+        const d = await r.json();
+        const stats = d.statistics || {};
+        // Show the category → stat structure with actual labels + values.
+        const cats = (stats.categories || []).map(c => ({
+          name: c.name,
+          // ESPN overview stats: labels[] aligns with c.stats[] (values).
+          count: c.count,
+          statKeys: keysOf(c)
+        }));
+        out.steps.overviewShape = {
+          player: "Bijan Robinson",
+          statsTopKeys: keysOf(stats),
+          displayName: stats.displayName,
+          labels: stats.labels || stats.names || null,
+          names: stats.names || null,
+          categories: cats,
+          // Dump the rushing category fully so we see values + how TDs are keyed.
+          rushingCategoryRaw: JSON.stringify(stats.categories?.find(c => c.name === "rushing") || {}).slice(0, 600),
+          receivingCategoryRaw: JSON.stringify(stats.categories?.find(c => c.name === "receiving") || {}).slice(0, 600)
+        };
+      } catch (e) { out.steps.overviewShape = { error: e.name==="AbortError"?"timeout":e.message }; }
 
       // ── Step 4: season-scoped team defense ────────────────────────────────
       try {
@@ -143,7 +139,7 @@ export default async function handler(req, res) {
       } catch (e) { out.steps.defense = { error: e.name==="AbortError"?"timeout":e.message }; }
     }
 
-    out.VERDICT = "Look at playerStatsProbe.candidates — find which endpoint returns httpStatus 200 with hasStatistics:true for Bijan Robinson. The snippet shows the raw shape. That's the endpoint the usage parser should use. defense is already confirmed working (categoryNames populated both years).";
+    out.VERDICT = "Look at overviewShape: labels[] tells the stat order, and rushingCategoryRaw/receivingCategoryRaw show the actual values array + how touchdowns are keyed. That maps the usage parser. Odds + defense already confirmed working.";
     return res.status(200).json(out);
   } catch (e) {
     out.fatal = e.message;
