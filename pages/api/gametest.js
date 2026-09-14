@@ -1,145 +1,172 @@
-// pages/api/gametest.js
-// Diagnostic: exercises every ESPN endpoint the app relies on for ONE game and
-// reports what actually came back — so we can verify response shapes before
-// building the UI on top of them. Visit:
-//   /api/gametest                 → auto-picks the first game of the current week
-//   /api/gametest?event_id=...    → a specific game
-// Each step shows whether it worked, the counts, and a small sample, plus the
-// raw field paths found — so if ESPN's shape differs from our parser, we see it.
+// pages/api/gamedata.js
+// Per-game NFL data for TD prediction. For one matchup, pulls each team's
+// skill-position players (RB/WR/TE) from the roster, their recent usage + TD
+// production from the gamelog, and the opponent's scoring defense. All from
+// ESPN's free endpoints. Called once per game by the frontend (POST).
 
 export const config = { maxDuration: 60 };
 
 const SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
-const WEB  = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
+const WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
+const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 
-async function fetchT(url, ms = 9000) {
+// Time budget: degrade gracefully instead of dying (lesson from HR Oracle).
+async function fetchT(url, ms = 7000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try { return await fetch(url, { signal: ctrl.signal }); }
   finally { clearTimeout(id); }
 }
 
-// Return the top-level keys of an object (so we can see the real shape).
-const keysOf = (o) => (o && typeof o === "object") ? Object.keys(o).slice(0, 25) : typeof o;
+// Skill positions that score the vast majority of non-QB TDs.
+const SKILL = new Set(["RB", "WR", "TE", "FB"]);
+
+// Pull a team's skill-position players from the roster endpoint.
+async function teamSkillPlayers(teamId, msLeft) {
+  if (!teamId || msLeft() < 6000) return [];
+  try {
+    const r = await fetchT(`${SITE}/teams/${teamId}/roster`, 7000);
+    const d = await r.json();
+    const out = [];
+    for (const group of d.athletes || []) {
+      // roster groups are keyed by position category (offense/defense/...).
+      for (const a of group.items || []) {
+        const pos = a.position?.abbreviation || "";
+        if (!SKILL.has(pos)) continue;
+        if (a.status && a.status.type && a.status.type !== "active") continue;
+        out.push({
+          id: a.id,
+          name: a.displayName || a.fullName || "?",
+          pos,
+          jersey: a.jersey || ""
+        });
+      }
+    }
+    return out;
+  } catch { return []; }
+}
+
+// Pull a player's season TD/usage totals. Uses the season-scoped statistics
+// endpoint; in early weeks the current season is empty, so we fall back to the
+// PRIOR season as the usage baseline. Returns per-game rates.
+async function playerRecent(athleteId, msLeft) {
+  if (!athleteId || msLeft() < 5000) return null;
+  const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
+  const year = new Date().getFullYear();
+  const tryYear = async (yr) => {
+    try {
+      const r = await fetchT(`${CORE}/seasons/${yr}/types/2/athletes/${athleteId}/statistics`, 6000);
+      if (!r.ok) return null;
+      const d = await r.json();
+      const cats = d.splits?.categories || [];
+      const grab = (catName, statName) => {
+        const cat = cats.find(c => (c.name||"").toLowerCase() === catName);
+        const st = (cat?.stats || []).find(s => (s.name||"").toLowerCase() === statName.toLowerCase());
+        return st ? parseFloat(st.value) || 0 : 0;
+      };
+      const gp = grab("general", "gamesPlayed") || grab("scoring", "gamesPlayed") || 0;
+      const rushTD = grab("rushing", "rushingTouchdowns");
+      const recTD  = grab("receiving", "receivingTouchdowns");
+      const carries = grab("rushing", "rushingAttempts");
+      const rec = grab("receiving", "receptions");
+      const targets = grab("receiving", "receivingTargets");
+      const totalTD = rushTD + recTD;
+      if (!gp && !totalTD) return null;
+      const g = gp || 1;
+      return {
+        stat_year: yr,
+        recent_games: gp,
+        recent_tds: totalTD,
+        td_rate: +(totalTD / g).toFixed(2),
+        touches_pg: +((carries + rec) / g).toFixed(1),
+        targets_pg: +(targets / g).toFixed(1)
+      };
+    } catch { return null; }
+  };
+  // Current season first; if empty (early weeks), fall back to prior season.
+  let out = await tryYear(year);
+  if ((!out || !out.recent_games) && msLeft() > 5000) out = await tryYear(year - 1);
+  return out;
+}
+
+// Opponent scoring defense: TDs and points allowed. Uses the season-scoped
+// team statistics endpoint (correct category structure), with prior-season
+// fallback in early weeks.
+async function teamDefense(teamId, msLeft) {
+  const o = {};
+  if (!teamId || msLeft() < 5000) return o;
+  const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
+  const year = new Date().getFullYear();
+  const tryYear = async (yr) => {
+    try {
+      const r = await fetchT(`${CORE}/seasons/${yr}/types/2/teams/${teamId}/statistics`, 6000);
+      if (!r.ok) return null;
+      const d = await r.json();
+      const cats = d.splits?.categories || [];
+      const found = {};
+      for (const c of cats) {
+        for (const s of c.stats || []) {
+          const nm = (s.name || "").toLowerCase();
+          if (nm === "totalpointsagainst" || nm === "pointsagainst") found.pts_allowed = Math.round(parseFloat(s.value)||0);
+          if (nm === "passingtouchdowns" && (c.name||"").toLowerCase().includes("passing")) found.pass_td_allowed = Math.round(parseFloat(s.value)||0);
+          if (nm === "rushingtouchdowns" && (c.name||"").toLowerCase().includes("rushing")) found.rush_td_allowed = Math.round(parseFloat(s.value)||0);
+        }
+      }
+      return Object.keys(found).length ? found : null;
+    } catch { return null; }
+  };
+  let d = await tryYear(year);
+  if (!d && msLeft() > 5000) d = await tryYear(year - 1);
+  return d || o;
+}
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  const out = { steps: {} };
+  const t0 = Date.now();
+  const msLeft = () => 55000 - (Date.now() - t0);
+
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = {}; } }
+  body = body || {};
+  const src = (k) => body[k] ?? req.query[k];
+
+  const away_team_id = src("away_team_id"), home_team_id = src("home_team_id");
+  const away_team = src("away_team"), home_team = src("home_team");
 
   try {
-    // ── Step 1: scoreboard → pick a game, inspect odds shape ────────────────
-    let eventId = req.query.event_id;
-    let homeId, awayId, homeAbbr, awayAbbr;
-    try {
-      const r = await fetchT(`${SITE}/scoreboard`);
-      const d = await r.json();
-      out.steps.scoreboard = {
-        httpStatus: r.status,
-        week: d.week?.number,
-        events: (d.events || []).length,
-        topKeys: keysOf(d)
-      };
-      const ev = eventId
-        ? (d.events || []).find(e => e.id === eventId)
-        : (d.events || [])[0];
-      if (ev) {
-        eventId = ev.id;
-        const comp = ev.competitions?.[0];
-        const home = comp?.competitors?.find(c => c.homeAway === "home");
-        const away = comp?.competitors?.find(c => c.homeAway === "away");
-        homeId = home?.team?.id; awayId = away?.team?.id;
-        homeAbbr = home?.team?.abbreviation; awayAbbr = away?.team?.abbreviation;
-        out.steps.picked = {
-          event_id: eventId,
-          matchup: `${awayAbbr}@${homeAbbr}`,
-          homeId, awayId,
-          // Inspect the ODDS shape — this drives implied totals.
-          hasOdds: !!comp?.odds?.length,
-          oddsSample: comp?.odds?.[0] ? {
-            keys: keysOf(comp.odds[0]),
-            details: comp.odds[0].details,
-            spread: comp.odds[0].spread,
-            overUnder: comp.odds[0].overUnder
-          } : null,
-          competitorKeys: keysOf(home || {})
-        };
-      } else {
-        out.steps.picked = { error: "no event found" };
-      }
-    } catch (e) { out.steps.scoreboard = { error: e.name==="AbortError"?"timeout":e.message }; }
+    const results = { players: { away: [], home: [] }, defense: {}, ok: true };
 
-    // ── Step 2: roster shape (skill players) ────────────────────────────────
-    if (homeId) {
-      try {
-        const r = await fetchT(`${SITE}/teams/${homeId}/roster`);
-        const d = await r.json();
-        const groups = d.athletes || [];
-        // Show how athletes are grouped + a sample athlete's shape.
-        let sampleAthlete = null, skillCount = 0;
-        const SKILL = new Set(["RB","WR","TE","FB"]);
-        for (const g of groups) {
-          for (const a of g.items || []) {
-            const pos = a.position?.abbreviation || "";
-            if (SKILL.has(pos)) {
-              skillCount++;
-              if (!sampleAthlete) sampleAthlete = { id:a.id, name:a.displayName, pos, keys:keysOf(a), hasStatus: !!a.status, statusShape: a.status ? keysOf(a.status) : null };
-            }
-          }
-        }
-        out.steps.roster = {
-          httpStatus: r.status,
-          groupCount: groups.length,
-          groupKeys: groups.map(g => g.position || g.displayName || "?").slice(0,10),
-          skillPlayers: skillCount,
-          sampleAthlete
-        };
-      } catch (e) { out.steps.roster = { error: e.name==="AbortError"?"timeout":e.message }; }
+    // Rosters first (fast, and everything else hangs off them).
+    const [awayPlayers, homePlayers] = await Promise.all([
+      teamSkillPlayers(away_team_id, msLeft),
+      teamSkillPlayers(home_team_id, msLeft)
+    ]);
 
-      // ── Step 3: season-scoped player stats (current + prior-season fallback) ──
-      const sampleId = out.steps.roster?.sampleAthlete?.id;
-      if (sampleId) {
-        const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
-        const yr = new Date().getFullYear();
-        const testStats = async (y) => {
-          try {
-            const r = await fetchT(`${CORE}/seasons/${y}/types/2/athletes/${sampleId}/statistics`);
-            if (!r.ok) return { year:y, httpStatus:r.status, ok:false };
-            const d = await r.json();
-            const cats = d.splits?.categories || [];
-            return {
-              year: y, httpStatus: r.status,
-              categoryNames: cats.map(c => c.name).slice(0,12),
-              rushingStats: (cats.find(c=>(c.name||"").toLowerCase()==="rushing")?.stats||[]).map(s=>s.name).slice(0,15),
-              sampleRushTD: (cats.find(c=>(c.name||"").toLowerCase()==="rushing")?.stats||[]).find(s=>(s.name||"").toLowerCase()==="rushingtouchdowns")?.value
-            };
-          } catch(e) { return { year:y, error: e.name==="AbortError"?"timeout":e.message }; }
-        };
-        out.steps.playerStats = {
-          player: out.steps.roster.sampleAthlete.name,
-          current: await testStats(yr),
-          prior: await testStats(yr - 1)
-        };
-      }
+    // Opponent defense (away players face home defense and vice-versa).
+    const [awayDef, homeDef] = await Promise.all([
+      teamDefense(away_team_id, msLeft),
+      teamDefense(home_team_id, msLeft)
+    ]);
+    results.defense = { away: awayDef, home: homeDef };
 
-      // ── Step 4: season-scoped team defense ────────────────────────────────
-      try {
-        const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
-        const yr = new Date().getFullYear();
-        const testDef = async (y) => {
-          const r = await fetchT(`${CORE}/seasons/${y}/types/2/teams/${homeId}/statistics`);
-          if (!r.ok) return { year:y, httpStatus:r.status };
-          const d = await r.json();
-          const cats = d.splits?.categories || [];
-          return { year:y, httpStatus:r.status, categoryNames: cats.map(c=>c.name).slice(0,15) };
-        };
-        out.steps.defense = { current: await testDef(yr), prior: await testDef(yr-1) };
-      } catch (e) { out.steps.defense = { error: e.name==="AbortError"?"timeout":e.message }; }
-    }
+    // Enrich each player with recent usage — but cap how many we hit per team
+    // (top of depth chart matters; deep bench players rarely score) and respect
+    // the time budget so a slow gamelog never kills the whole game.
+    const enrich = async (players) => {
+      const top = players.slice(0, 8); // ~RB1-2, WR1-3, TE1-2
+      await Promise.all(top.map(async (p) => {
+        const rec = await playerRecent(p.id, msLeft);
+        if (rec) Object.assign(p, rec);
+      }));
+      // Keep only players with some recent usage OR a clear role (top of list).
+      return top;
+    };
 
-    out.VERDICT = "Check playerStats.current vs playerStats.prior — in Week 1 current will be empty and prior (last season) should have rushing/receiving categories with TD values. If prior has categoryNames incl 'rushing'/'receiving' and a sampleRushTD number, the usage parser works. defense.prior.categoryNames should include scoring/defensive categories.";
-    return res.status(200).json(out);
+    results.players.away = await enrich(awayPlayers);
+    results.players.home = await enrich(homePlayers);
+
+    return res.status(200).json(results);
   } catch (e) {
-    out.fatal = e.message;
-    return res.status(200).json(out);
+    return res.status(200).json({ error: e.message, players: { away: [], home: [] } });
   }
 }
