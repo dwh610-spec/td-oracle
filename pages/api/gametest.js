@@ -104,23 +104,31 @@ export default async function handler(req, res) {
         const r = await fetchT(`${WEBB}/athletes/${STAR_ID}/overview`, 6000);
         const d = await r.json();
         const stats = d.statistics || {};
-        // Show the category → stat structure with actual labels + values.
-        const cats = (stats.categories || []).map(c => ({
-          name: c.name,
-          // ESPN overview stats: labels[] aligns with c.stats[] (values).
-          count: c.count,
-          statKeys: keysOf(c)
-        }));
+        // Dump the EXACT splits shape (where the values live) + run a live parse.
+        const sp = stats.splits;
+        let values = null;
+        if (Array.isArray(sp)) values = sp;
+        else if (sp && Array.isArray(sp.stats)) values = sp.stats;
+        else if (sp && Array.isArray(sp.values)) values = sp.values;
+
+        const names = stats.names || [];
+        const byName = (key) => {
+          const i = names.findIndex(n => String(n).toLowerCase() === key.toLowerCase());
+          return (i>=0 && values && values[i]!=null) ? values[i] : null;
+        };
         out.steps.overviewShape = {
           player: "Bijan Robinson",
-          statsTopKeys: keysOf(stats),
-          displayName: stats.displayName,
-          labels: stats.labels || stats.names || null,
-          names: stats.names || null,
-          categories: cats,
-          // Dump the rushing category fully so we see values + how TDs are keyed.
-          rushingCategoryRaw: JSON.stringify(stats.categories?.find(c => c.name === "rushing") || {}).slice(0, 600),
-          receivingCategoryRaw: JSON.stringify(stats.categories?.find(c => c.name === "receiving") || {}).slice(0, 600)
+          splitsType: Array.isArray(sp) ? "array" : (sp ? "object:"+keysOf(sp) : "missing"),
+          valuesFound: !!values,
+          valuesSample: values ? values.slice(0, 12) : null,
+          names: names,
+          // Live parse of the key stats — proves the production parser will work.
+          parsed: {
+            rushingTouchdowns: byName("rushingTouchdowns"),
+            receivingTouchdowns: byName("receivingTouchdowns"),
+            rushingAttempts: byName("rushingAttempts"),
+            receptions: byName("receptions")
+          }
         };
       } catch (e) { out.steps.overviewShape = { error: e.name==="AbortError"?"timeout":e.message }; }
 
@@ -139,7 +147,7 @@ export default async function handler(req, res) {
       } catch (e) { out.steps.defense = { error: e.name==="AbortError"?"timeout":e.message }; }
     }
 
-    out.VERDICT = "Look at overviewShape: labels[] tells the stat order, and rushingCategoryRaw/receivingCategoryRaw show the actual values array + how touchdowns are keyed. That maps the usage parser. Odds + defense already confirmed working.";
+    out.VERDICT = "overviewShape.parsed should show real numbers (Bijan's rushingTouchdowns etc). If parsed has numbers, the production parser works and ALL data sources are confirmed — ready to build the app. If parsed is null, valuesSample + splitsType show where the values actually live.";
     return res.status(200).json(out);
   } catch (e) {
     out.fatal = e.message;
