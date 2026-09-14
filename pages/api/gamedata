@@ -46,47 +46,59 @@ async function teamSkillPlayers(teamId, msLeft) {
   } catch { return []; }
 }
 
-// Pull a player's season TD/usage totals. Uses the season-scoped statistics
-// endpoint; in early weeks the current season is empty, so we fall back to the
-// PRIOR season as the usage baseline. Returns per-game rates.
+// Pull a player's TD/usage from the ESPN "overview" endpoint (confirmed shape:
+// statistics.names[] is a flat index map like ["rushingAttempts",...,
+// "rushingTouchdowns",...,"receivingTouchdowns",...] and the aligned values
+// live in statistics.splits. We match by the unambiguous `names` keys.
 async function playerRecent(athleteId, msLeft) {
   if (!athleteId || msLeft() < 5000) return null;
-  const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
-  const year = new Date().getFullYear();
-  const tryYear = async (yr) => {
-    try {
-      const r = await fetchT(`${CORE}/seasons/${yr}/types/2/athletes/${athleteId}/statistics`, 6000);
-      if (!r.ok) return null;
-      const d = await r.json();
-      const cats = d.splits?.categories || [];
-      const grab = (catName, statName) => {
-        const cat = cats.find(c => (c.name||"").toLowerCase() === catName);
-        const st = (cat?.stats || []).find(s => (s.name||"").toLowerCase() === statName.toLowerCase());
-        return st ? parseFloat(st.value) || 0 : 0;
-      };
-      const gp = grab("general", "gamesPlayed") || grab("scoring", "gamesPlayed") || 0;
-      const rushTD = grab("rushing", "rushingTouchdowns");
-      const recTD  = grab("receiving", "receivingTouchdowns");
-      const carries = grab("rushing", "rushingAttempts");
-      const rec = grab("receiving", "receptions");
-      const targets = grab("receiving", "receivingTargets");
-      const totalTD = rushTD + recTD;
-      if (!gp && !totalTD) return null;
-      const g = gp || 1;
-      return {
-        stat_year: yr,
-        recent_games: gp,
-        recent_tds: totalTD,
-        td_rate: +(totalTD / g).toFixed(2),
-        touches_pg: +((carries + rec) / g).toFixed(1),
-        targets_pg: +(targets / g).toFixed(1)
-      };
-    } catch { return null; }
-  };
-  // Current season first; if empty (early weeks), fall back to prior season.
-  let out = await tryYear(year);
-  if ((!out || !out.recent_games) && msLeft() > 5000) out = await tryYear(year - 1);
-  return out;
+  const WEBB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
+  try {
+    const r = await fetchT(`${WEBB}/athletes/${athleteId}/overview`, 6000);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const stats = d.statistics || {};
+    const names = stats.names || stats.labels || [];
+    if (!names.length) return null;
+
+    // Values align with names[]. They live in statistics.splits — which may be an
+    // array of stat strings, or an object with a .stats array. Handle both.
+    let values = null;
+    const sp = stats.splits;
+    if (Array.isArray(sp)) values = sp;
+    else if (sp && Array.isArray(sp.stats)) values = sp.stats;
+    else if (sp && Array.isArray(sp.values)) values = sp.values;
+    if (!values) return null;
+
+    const byName = (key) => {
+      const i = names.findIndex(n => String(n).toLowerCase() === key.toLowerCase());
+      if (i < 0 || values[i] == null) return 0;
+      const num = parseFloat(String(values[i]).replace(/[^0-9.\-]/g, ""));
+      return isNaN(num) ? 0 : num;
+    };
+
+    const rushTD  = byName("rushingTouchdowns");
+    const recTD   = byName("receivingTouchdowns");
+    const carries = byName("rushingAttempts");
+    const rec     = byName("receptions");
+    const targets = byName("receivingTargets"); // may be absent; 0 if so
+    const totalTD = rushTD + recTD;
+
+    // games played isn't in the offense names array; derive a per-game rate from
+    // the team's games if present, else treat totals as a season line (17 games).
+    const gp = byName("gamesPlayed") || 17;
+
+    if (!totalTD && !carries && !rec) return null; // no usable usage
+    return {
+      stat_source: stats.displayName || "season",
+      season_tds: totalTD,
+      season_carries: carries,
+      season_rec: rec,
+      td_rate: +(totalTD / gp).toFixed(2),
+      touches_pg: +((carries + rec) / gp).toFixed(1),
+      targets_pg: targets ? +(targets / gp).toFixed(1) : null
+    };
+  } catch { return null; }
 }
 
 // Opponent scoring defense: TDs and points allowed. Uses the season-scoped
