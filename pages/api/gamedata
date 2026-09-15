@@ -46,10 +46,14 @@ async function teamSkillPlayers(teamId, msLeft) {
   } catch { return []; }
 }
 
-// Pull a player's TD/usage from the ESPN "overview" endpoint (confirmed shape:
-// statistics.names[] is a flat index map like ["rushingAttempts",...,
-// "rushingTouchdowns",...,"receivingTouchdowns",...] and the aligned values
-// live in statistics.splits. We match by the unambiguous `names` keys.
+// Pull a player's TD/usage from the ESPN "overview" endpoint. CONFIRMED shape:
+//   statistics.names[]  = flat index map: ["rushingAttempts",...,
+//                          "rushingTouchdowns",...,"receivingTouchdowns",...]
+//   statistics.splits[] = array of {displayName, stats:[...]} where each stats
+//                          array aligns with names[]. Splits include "Regular
+//                          Season", "Projected", and "Career".
+// We read the Regular Season split (current form); if it's all zeros/empty
+// (early in the year), fall back to Career as a role/usage baseline.
 async function playerRecent(athleteId, msLeft) {
   if (!athleteId || msLeft() < 5000) return null;
   const WEBB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
@@ -58,45 +62,48 @@ async function playerRecent(athleteId, msLeft) {
     if (!r.ok) return null;
     const d = await r.json();
     const stats = d.statistics || {};
-    const names = stats.names || stats.labels || [];
-    if (!names.length) return null;
+    const names = stats.names || [];
+    const splits = Array.isArray(stats.splits) ? stats.splits : [];
+    if (!names.length || !splits.length) return null;
 
-    // Values align with names[]. They live in statistics.splits — which may be an
-    // array of stat strings, or an object with a .stats array. Handle both.
-    let values = null;
-    const sp = stats.splits;
-    if (Array.isArray(sp)) values = sp;
-    else if (sp && Array.isArray(sp.stats)) values = sp.stats;
-    else if (sp && Array.isArray(sp.values)) values = sp.values;
-    if (!values) return null;
+    const idx = (key) => names.findIndex(n => String(n).toLowerCase() === key.toLowerCase());
+    const iRushTD = idx("rushingTouchdowns");
+    const iRecTD  = idx("receivingTouchdowns");
+    const iCar    = idx("rushingAttempts");
+    const iRec    = idx("receptions");
 
-    const byName = (key) => {
-      const i = names.findIndex(n => String(n).toLowerCase() === key.toLowerCase());
-      if (i < 0 || values[i] == null) return 0;
-      const num = parseFloat(String(values[i]).replace(/[^0-9.\-]/g, ""));
-      return isNaN(num) ? 0 : num;
+    const readSplit = (sp) => {
+      const arr = sp?.stats || [];
+      const num = (i) => (i>=0 && arr[i]!=null) ? (parseFloat(String(arr[i]).replace(/[^0-9.\-]/g,""))||0) : 0;
+      return { rushTD:num(iRushTD), recTD:num(iRecTD), carries:num(iCar), rec:num(iRec) };
     };
 
-    const rushTD  = byName("rushingTouchdowns");
-    const recTD   = byName("receivingTouchdowns");
-    const carries = byName("rushingAttempts");
-    const rec     = byName("receptions");
-    const targets = byName("receivingTargets"); // may be absent; 0 if so
-    const totalTD = rushTD + recTD;
+    const findSplit = (nameWants) => splits.find(s => nameWants.some(w => (s.displayName||"").toLowerCase().includes(w)));
+    const regular = findSplit(["regular season"]) || splits[0];
+    const career  = findSplit(["career"]);
 
-    // games played isn't in the offense names array; derive a per-game rate from
-    // the team's games if present, else treat totals as a season line (17 games).
-    const gp = byName("gamesPlayed") || 17;
+    let src = "2026 regular season";
+    let v = readSplit(regular);
+    // If nothing has happened yet this season, use career as the baseline.
+    if (!v.rushTD && !v.recTD && !v.carries && !v.rec && career) {
+      v = readSplit(career);
+      src = "career baseline";
+    }
+    if (!v.carries && !v.rec && !v.rushTD && !v.recTD) return null;
 
-    if (!totalTD && !carries && !rec) return null; // no usable usage
+    const totalTD = v.rushTD + v.recTD;
+    // Per-game basis: Regular Season is this year's games; Career spans seasons,
+    // so for the career fallback we normalize per 17-game season for a rate.
+    const basis = src === "career baseline" ? Math.max(1, Math.round((v.carries + v.rec) / 20)) * 17 : 17;
+    const perG = (n) => +(n / (src === "career baseline" ? basis : 17)).toFixed(2);
+
     return {
-      stat_source: stats.displayName || "season",
-      season_tds: totalTD,
-      season_carries: carries,
-      season_rec: rec,
-      td_rate: +(totalTD / gp).toFixed(2),
-      touches_pg: +((carries + rec) / gp).toFixed(1),
-      targets_pg: targets ? +(targets / gp).toFixed(1) : null
+      stat_source: src,
+      total_tds: totalTD,
+      carries: v.carries,
+      receptions: v.rec,
+      td_rate: perG(totalTD),
+      touches_pg: +((v.carries + v.rec) / (src === "career baseline" ? basis : 17)).toFixed(1)
     };
   } catch { return null; }
 }
