@@ -20,7 +20,7 @@ async function fetchT(url, ms = 7000) {
 
 const SKILL = new Set(["RB", "WR", "TE", "FB"]);
 const DEF_POS = new Set(["CB", "S", "SS", "FS", "LB", "MLB", "OLB", "ILB", "DE", "DT", "DL", "NT"]);
-const OUT_LIKE = /\bout\b|injured reserve|\bir\b|\bpup\b|suspend|non-football|did not report|doubtful/i;
+const OUT_LIKE = /\bout\b|\binactive\b|unavailable|injured reserve|\breserve\/|\bir\b|\bpup\b|physically unable|suspend|non-football|did not report|doubtful/i;
 
 // ── Static stadium reference (lat/lon + roof type). ESPN's scoreboard venue
 // field shape wasn't verified live, so weather uses this instead — stadiums
