@@ -1,18 +1,16 @@
 // pages/api/gamedata.js
 // Per-game NFL data for TD prediction. For one matchup, pulls each team's
 // skill-position players (RB/WR/TE) from the roster, excludes anyone
-// currently Out/IR/PUP/Suspended (real injuries endpoint, not the roster
-// group heuristic), their recent usage + TD production from the gamelog,
-// and the opponent's scoring defense. All from ESPN's free endpoints.
-// Called once per game by the frontend (POST).
+// currently Out/IR/PUP/Suspended, their recent usage + TD production, the
+// opponent's scoring defense (with key defensive injuries), each team's
+// run/pass offensive lean, and — when a kickoff date is supplied — outdoor
+// game weather. All from free sources (ESPN + Open-Meteo).
 
 export const config = { maxDuration: 60 };
 
 const SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
-const WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
 const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 
-// Time budget: degrade gracefully instead of dying (lesson from HR Oracle).
 async function fetchT(url, ms = 7000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
@@ -20,22 +18,41 @@ async function fetchT(url, ms = 7000) {
   finally { clearTimeout(id); }
 }
 
-// Skill positions that score the vast majority of non-QB TDs.
 const SKILL = new Set(["RB", "WR", "TE", "FB"]);
-
-// Statuses that mean "will not play." Questionable/Probable stay eligible —
-// they play more often than not. Everything here is a near-certain scratch.
+const DEF_POS = new Set(["CB", "S", "SS", "FS", "LB", "MLB", "OLB", "ILB", "DE", "DT", "DL", "NT"]);
 const OUT_LIKE = /\bout\b|injured reserve|\bir\b|\bpup\b|suspend|non-football|did not report|doubtful/i;
 
-// Real injury designations live on a SEPARATE endpoint from the roster —
-// site.api.espn.com's roster response does NOT reliably carry status, so the
-// old approach (checking roster group names for "injured"/"suspended") was
-// checking the wrong place and effectively never fired. This hits the actual
-// injuries endpoint and resolves however many $ref entries it returns (core
-// API list endpoints are usually ref-only), bounded and parallel so a slow
-// resolve can't eat the whole time budget.
-async function teamInjuredIds(teamId, msLeft) {
-  const out = new Set();
+// ── Static stadium reference (lat/lon + roof type). ESPN's scoreboard venue
+// field shape wasn't verified live, so weather uses this instead — stadiums
+// essentially never move, so this doesn't go stale the way live data would.
+// Retractable-roof stadiums are treated as domes (closed more often than not,
+// and we have no free way to know game-day roof status) — weather is skipped
+// for all of these, which just means no wind/rain signal, never a wrong one.
+const STADIUMS = {
+  ARI:{lat:33.5276,lon:-112.2626,dome:true}, ATL:{lat:33.7554,lon:-84.4008,dome:true},
+  BAL:{lat:39.2780,lon:-76.6227,dome:false}, BUF:{lat:42.7738,lon:-78.7870,dome:false},
+  CAR:{lat:35.2258,lon:-80.8528,dome:false}, CHI:{lat:41.8623,lon:-87.6167,dome:false},
+  CIN:{lat:39.0954,lon:-84.5160,dome:false}, CLE:{lat:41.5061,lon:-81.6995,dome:false},
+  DAL:{lat:32.7473,lon:-97.0945,dome:true},  DEN:{lat:39.7439,lon:-105.0201,dome:false},
+  DET:{lat:42.3400,lon:-83.0456,dome:true},  GB:{lat:44.5013,lon:-88.0622,dome:false},
+  HOU:{lat:29.6847,lon:-95.4107,dome:true},  IND:{lat:39.7601,lon:-86.1639,dome:true},
+  JAX:{lat:30.3239,lon:-81.6373,dome:false}, KC:{lat:39.0489,lon:-94.4839,dome:false},
+  LV:{lat:36.0909,lon:-115.1833,dome:true},  LAC:{lat:33.9535,lon:-118.3392,dome:true},
+  LAR:{lat:33.9535,lon:-118.3392,dome:true}, MIA:{lat:25.9580,lon:-80.2389,dome:false},
+  MIN:{lat:44.9738,lon:-93.2577,dome:true},  NE:{lat:42.0909,lon:-71.2643,dome:false},
+  NO:{lat:29.9511,lon:-90.0812,dome:true},   NYG:{lat:40.8135,lon:-74.0745,dome:false},
+  NYJ:{lat:40.8135,lon:-74.0745,dome:false}, PHI:{lat:39.9008,lon:-75.1675,dome:false},
+  PIT:{lat:40.4468,lon:-80.0158,dome:false}, SF:{lat:37.4032,lon:-121.9698,dome:false},
+  SEA:{lat:47.5952,lon:-122.3316,dome:false},TB:{lat:27.9759,lon:-82.5033,dome:false},
+  TEN:{lat:36.1665,lon:-86.7713,dome:false}, WSH:{lat:38.9077,lon:-76.8645,dome:false}
+};
+
+// Real injury designations live on a SEPARATE endpoint from the roster.
+// Returns richer objects (not just ids) so callers can both (a) exclude an
+// injured player from their own team's skill list and (b) surface injured
+// DEFENSIVE players as context for the opposing offense.
+async function teamInjuries(teamId, msLeft) {
+  const out = [];
   if (!teamId || msLeft() < 5000) return out;
   try {
     const r = await fetchT(`${CORE}/teams/${teamId}/injuries`, 6000);
@@ -60,26 +77,32 @@ async function teamInjuredIds(teamId, msLeft) {
         if (!statusText || !OUT_LIKE.test(statusText)) return;
 
         let athleteId = obj.athlete?.id || obj.athleteId || null;
-        if (!athleteId && obj.athlete?.$ref) {
-          const m = String(obj.athlete.$ref).match(/athletes\/(\d+)/);
-          if (m) athleteId = m[1];
+        let athleteName = obj.athlete?.displayName || obj.athlete?.fullName || null;
+        let athletePos = obj.athlete?.position?.abbreviation || null;
+        if ((!athleteId || !athleteName) && obj.athlete?.$ref) {
+          try {
+            const ar = await fetchT(obj.athlete.$ref, 4000);
+            if (ar.ok) {
+              const ad = await ar.json();
+              athleteId = athleteId || ad.id;
+              athleteName = athleteName || ad.displayName || ad.fullName;
+              athletePos = athletePos || ad.position?.abbreviation;
+            }
+          } catch {}
         }
         if (!athleteId && obj.$ref) {
           const m = String(obj.$ref).match(/athletes\/(\d+)/);
           if (m) athleteId = m[1];
         }
-        if (athleteId) out.add(String(athleteId));
+        if (athleteId) out.push({ id: String(athleteId), name: athleteName || "?", pos: athletePos || "?", status: statusText });
       } catch {}
     };
 
-    // Bounded: a team's injury list is normally short (a handful of players),
-    // but cap it defensively so a bloated response can't stall the request.
     await Promise.all(items.slice(0, 20).map(resolveOne));
   } catch {}
   return out;
 }
 
-// Pull a team's skill-position players from the roster endpoint.
 async function teamSkillPlayers(teamId, msLeft) {
   if (!teamId || msLeft() < 6000) return [];
   try {
@@ -92,34 +115,13 @@ async function teamSkillPlayers(teamId, msLeft) {
         if (!SKILL.has(pos)) continue;
         const grp = (group.position || "").toLowerCase();
         if (grp.includes("injured") || grp.includes("suspended") || grp.includes("practice")) continue;
-        out.push({
-          id: a.id,
-          name: a.displayName || a.fullName || "?",
-          pos,
-          jersey: a.jersey || ""
-        });
+        out.push({ id: a.id, name: a.displayName || a.fullName || "?", pos, jersey: a.jersey || "" });
       }
     }
     return out;
   } catch { return []; }
 }
 
-// Pull a player's TD/usage from the ESPN "overview" endpoint. CONFIRMED shape:
-//   statistics.names[]  = flat index map: ["rushingAttempts",...,
-//                          "rushingTouchdowns",...,"receivingTouchdowns",...]
-//   statistics.splits[] = array of {displayName, stats:[...]} where each stats
-//                          array aligns with names[]. Splits include "Regular
-//                          Season", "Projected", and "Career".
-// We read the Regular Season split (current form); if it's all zeros/empty
-// (early in the year), fall back to Career as a role/usage baseline.
-//
-// Rate math: the Regular Season split is a season-to-date TOTAL, not a full
-// season. Dividing by a fixed 17 early in the year drastically understates
-// anyone who's had one big game so far (e.g. 2 TDs / 17 = 0.12, when the real
-// current rate is 2.0/game). We look for a "gamesPlayed" stat in names[] and
-// use that as the real denominator; if ESPN doesn't expose it in this split,
-// we fall back to the fixed-17 estimate and flag it in stat_basis so this is
-// visible/checkable rather than silently wrong.
 async function playerRecent(athleteId, msLeft) {
   if (!athleteId || msLeft() < 5000) return null;
   const WEBB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
@@ -151,7 +153,6 @@ async function playerRecent(athleteId, msLeft) {
 
     let src = "2026 regular season";
     let v = readSplit(regular);
-    // If nothing has happened yet this season, use career as the baseline.
     if (!v.rushTD && !v.recTD && !v.carries && !v.rec && career) {
       v = readSplit(career);
       src = "career baseline";
@@ -159,20 +160,14 @@ async function playerRecent(athleteId, msLeft) {
     if (!v.carries && !v.rec && !v.rushTD && !v.recTD) return null;
 
     const totalTD = v.rushTD + v.recTD;
-
     let gamesForRate, statBasis;
     if (src === "career baseline") {
-      // Normalize career totals to a per-17-game-season rate, same as before.
       gamesForRate = Math.max(1, Math.round((v.carries + v.rec) / 20)) * 17;
       statBasis = "career, normalized to 17-game season";
     } else if (iGP >= 0 && v.gp > 0) {
-      // Real games-played from ESPN — the accurate denominator.
       gamesForRate = v.gp;
       statBasis = "regular season / actual games played";
     } else {
-      // ESPN didn't expose gamesPlayed in this split — fall back to the old
-      // fixed-17 estimate. This will understate early-season hot starts;
-      // flagged here so it's visible if this path is still firing later.
       gamesForRate = 17;
       statBasis = "regular season / 17-game estimate (gamesPlayed not found)";
     }
@@ -189,10 +184,9 @@ async function playerRecent(athleteId, msLeft) {
   } catch { return null; }
 }
 
-// Opponent scoring defense: TDs and points allowed. Uses the season-scoped
-// team statistics endpoint (correct category structure), with prior-season
-// fallback in early weeks.
-async function teamDefense(teamId, msLeft) {
+// Team profile: scoring defense (for the opposing offense's matchup read)
+// PLUS this team's own run/pass offensive lean (for the funnel read).
+async function teamProfile(teamId, msLeft) {
   const o = {};
   if (!teamId || msLeft() < 5000) return o;
   const year = new Date().getFullYear();
@@ -204,11 +198,16 @@ async function teamDefense(teamId, msLeft) {
       const cats = d.splits?.categories || [];
       const found = {};
       for (const c of cats) {
+        const catName = (c.name || "").toLowerCase();
         for (const s of c.stats || []) {
           const nm = (s.name || "").toLowerCase();
-          if (nm === "totalpointsagainst" || nm === "pointsagainst") found.pts_allowed = Math.round(parseFloat(s.value)||0);
-          if (nm === "passingtouchdowns" && (c.name||"").toLowerCase().includes("passing")) found.pass_td_allowed = Math.round(parseFloat(s.value)||0);
-          if (nm === "rushingtouchdowns" && (c.name||"").toLowerCase().includes("rushing")) found.rush_td_allowed = Math.round(parseFloat(s.value)||0);
+          const val = parseFloat(s.value) || 0;
+          if (nm === "totalpointsagainst" || nm === "pointsagainst") found.pts_allowed = Math.round(val);
+          if (nm === "passingtouchdowns" && catName.includes("passing")) found.pass_td_allowed = Math.round(val);
+          if (nm === "rushingtouchdowns" && catName.includes("rushing")) found.rush_td_allowed = Math.round(val);
+          // Offensive identity — same categories, this team's own attempts.
+          if (nm === "rushingattempts" && catName.includes("rushing")) found.rush_attempts = Math.round(val);
+          if ((nm === "passingattempts" || nm === "attempts") && catName.includes("passing")) found.pass_attempts = Math.round(val);
         }
       }
       return Object.keys(found).length ? found : null;
@@ -216,7 +215,31 @@ async function teamDefense(teamId, msLeft) {
   };
   let d = await tryYear(year);
   if (!d && msLeft() > 5000) d = await tryYear(year - 1);
-  return d || o;
+  if (!d) return o;
+  if (d.rush_attempts != null && d.pass_attempts != null && (d.rush_attempts + d.pass_attempts) > 0) {
+    d.rush_pct = Math.round((d.rush_attempts / (d.rush_attempts + d.pass_attempts)) * 100);
+  }
+  return d;
+}
+
+// Weather — only when a kickoff date is supplied AND the stadium is outdoor.
+// Free, no key, via Open-Meteo.
+async function fetchWeather(homeTeamAbbr, kickoffDate, msLeft) {
+  const stadium = STADIUMS[homeTeamAbbr];
+  if (!stadium || stadium.dome || !kickoffDate || msLeft() < 5000) return null;
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${stadium.lat}&longitude=${stadium.lon}&hourly=temperature_2m,precipitation_probability,windspeed_10m&start_date=${kickoffDate}&end_date=${kickoffDate}&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto`;
+    const r = await fetchT(url, 6000);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const h = d.hourly;
+    if (!h?.windspeed_10m?.length) return null;
+    return {
+      temp_f: Math.round(h.temperature_2m.reduce((a,b)=>a+b,0) / h.temperature_2m.length),
+      wind_mph: Math.round(Math.max(...h.windspeed_10m)),
+      precip_pct: Math.round(Math.max(...(h.precipitation_probability || [0])))
+    };
+  } catch { return null; }
 }
 
 export default async function handler(req, res) {
@@ -231,45 +254,53 @@ export default async function handler(req, res) {
 
   let away_team_id = src("away_team_id"), home_team_id = src("home_team_id");
   let away_team = src("away_team"), home_team = src("home_team");
-  // Browser-testable default (DEN@KC from the diagnostic): visit /api/gamedata
-  // with no params to sanity-check the pipeline.
+  // Optional — pass a "YYYY-MM-DD" kickoff date to enable weather. Without
+  // it, weather is simply skipped (not guessed).
+  const kickoff_date = src("kickoff_date") || null;
+
   if (!away_team_id && !home_team_id) {
     away_team_id = "7"; home_team_id = "12"; away_team = "DEN"; home_team = "KC";
   }
 
   try {
-    const results = { players: { away: [], home: [] }, defense: {}, ok: true,
+    const results = { players: { away: [], home: [] }, defense: {}, weather: null, ok: true,
       debug: { away_team_id: away_team_id||null, home_team_id: home_team_id||null } };
 
-    // Roster + injuries + defense all fire in parallel — independent calls.
-    const [awayPlayersRaw, homePlayersRaw, awayInjured, homeInjured, awayDef, homeDef] = await Promise.all([
+    const [awayPlayersRaw, homePlayersRaw, awayInj, homeInj, awayProf, homeProf, weather] = await Promise.all([
       teamSkillPlayers(away_team_id, msLeft),
       teamSkillPlayers(home_team_id, msLeft),
-      teamInjuredIds(away_team_id, msLeft),
-      teamInjuredIds(home_team_id, msLeft),
-      teamDefense(away_team_id, msLeft),
-      teamDefense(home_team_id, msLeft)
+      teamInjuries(away_team_id, msLeft),
+      teamInjuries(home_team_id, msLeft),
+      teamProfile(away_team_id, msLeft),
+      teamProfile(home_team_id, msLeft),
+      fetchWeather(home_team, kickoff_date, msLeft)
     ]);
 
-    // Filter out anyone confirmed Out/IR/PUP/Suspended BEFORE picking the
-    // top-8 depth-chart slice, so a healthy backup takes the roster spot
-    // instead of the slot being wasted on someone who can't play.
-    const awayPlayers = awayPlayersRaw.filter(p => !awayInjured.has(String(p.id)));
-    const homePlayers = homePlayersRaw.filter(p => !homeInjured.has(String(p.id)));
+    const awayInjOwnIds = new Set(awayInj.filter(p => SKILL.has(p.pos)).map(p => p.id));
+    const homeInjOwnIds = new Set(homeInj.filter(p => SKILL.has(p.pos)).map(p => p.id));
+    const awayPlayers = awayPlayersRaw.filter(p => !awayInjOwnIds.has(String(p.id)));
+    const homePlayers = homePlayersRaw.filter(p => !homeInjOwnIds.has(String(p.id)));
+
+    // Defensive-position injuries, for the OPPOSING offense's context.
+    const awayDefInjuries = awayInj.filter(p => DEF_POS.has(p.pos)).map(p => `${p.name}(${p.pos})`);
+    const homeDefInjuries = homeInj.filter(p => DEF_POS.has(p.pos)).map(p => `${p.name}(${p.pos})`);
 
     results.debug.rosterAway = awayPlayers.length;
     results.debug.rosterHome = homePlayers.length;
     results.debug.injuredExcludedAway = awayPlayersRaw.length - awayPlayers.length;
     results.debug.injuredExcludedHome = homePlayersRaw.length - homePlayers.length;
     results.debug.sampleNames = [...awayPlayers.slice(0,2), ...homePlayers.slice(0,2)].map(p => p.name);
+    results.debug.weatherRequested = !!kickoff_date;
+    results.debug.weatherReturned = !!weather;
 
-    results.defense = { away: awayDef, home: homeDef };
+    results.defense = {
+      away: { ...awayProf, def_injuries: awayDefInjuries },
+      home: { ...homeProf, def_injuries: homeDefInjuries }
+    };
+    results.weather = weather;
 
-    // Enrich each player with recent usage — but cap how many we hit per team
-    // (top of depth chart matters; deep bench players rarely score) and respect
-    // the time budget so a slow gamelog never kills the whole game.
     const enrich = async (players) => {
-      const top = players.slice(0, 8); // ~RB1-2, WR1-3, TE1-2
+      const top = players.slice(0, 8);
       await Promise.all(top.map(async (p) => {
         try { const rec = await playerRecent(p.id, msLeft); if (rec) Object.assign(p, rec); } catch {}
       }));
