@@ -11,7 +11,7 @@ const estTokens = (s) => Math.ceil((s || "").length / 4);
 
 // ── Prompt building ─────────────────────────────────────────────────────────
 function gameBlock(game, gd) {
-  const fmt = (arr, oppDef) => (arr || []).map(p => {
+  const fmt = (arr) => (arr || []).map(p => {
     const usage = p.td_rate != null
       ? ` TD/g${p.td_rate} touch/g${p.touches_pg ?? "?"} tgt/g${p.targets_pg ?? "?"} L${p.recent_games}:${p.recent_tds}TD`
       : " (limited recent data)";
@@ -24,19 +24,23 @@ function gameBlock(game, gd) {
     if (d.pts_allowed != null) bits.push(`PA ${d.pts_allowed}`);
     if (d.rush_td_allowed != null) bits.push(`rushTD-allowed ${d.rush_td_allowed}`);
     if (d.pass_td_allowed != null) bits.push(`passTD-allowed ${d.pass_td_allowed}`);
+    if (d.def_injuries && d.def_injuries.length) bits.push(`KEY DEF INJURIES (OUT): ${d.def_injuries.join(", ")}`);
     return bits.length ? ` [opp def: ${bits.join(", ")}]` : "";
   };
+
+  const funnelStr = (d) => (d && d.rush_pct != null) ? ` [own O-lean: ${d.rush_pct}% rush / ${100-d.rush_pct}% pass]` : "";
 
   const line = game.spread != null ? ` spread ${game.spread}` : "";
   const ou = game.over_under != null ? ` O/U ${game.over_under}` : "";
   const impl = (game.away_implied != null)
     ? ` implied: ${game.away_team} ${game.away_implied} / ${game.home_team} ${game.home_implied}` : "";
+  const wx = gd?.weather ? ` WEATHER: ${gd.weather.temp_f}°F, wind ${gd.weather.wind_mph}mph, precip ${gd.weather.precip_pct}%` : "";
 
-  return `=== ${game.away_team}@${game.home_team}${line}${ou}${impl}
-${game.away_team} players (vs ${game.home_team} def${defStr(gd?.defense?.home)}):
-${fmt(gd?.players?.away, gd?.defense?.home)}
-${game.home_team} players (vs ${game.away_team} def${defStr(gd?.defense?.away)}):
-${fmt(gd?.players?.home, gd?.defense?.away)}`;
+  return `=== ${game.away_team}@${game.home_team}${line}${ou}${impl}${wx}
+${game.away_team} players (vs ${game.home_team} def${defStr(gd?.defense?.home)})${funnelStr(gd?.defense?.away)}:
+${fmt(gd?.players?.away)}
+${game.home_team} players (vs ${game.away_team} def${defStr(gd?.defense?.away)})${funnelStr(gd?.defense?.home)}:
+${fmt(gd?.players?.home)}`;
 }
 
 const INSTRUCTIONS_HEAD = `You are an NFL anytime-touchdown predictor. For the slate below, rank the players MOST likely to score a touchdown (rushing OR receiving) in their game.
@@ -46,9 +50,10 @@ Return the 2-3 STRONGEST anytime-TD candidates FROM EACH GAME — every game rep
 const INSTRUCTIONS_TAIL = `SCORING PRIORITY:
 (1) VEGAS IMPLIED TEAM TOTAL is the #1 environment factor — a team implied for 27+ points scores multiple TDs; under ~17 rarely finds the end zone. Favor players on high-implied-total teams.
 (2) RED-ZONE / GOAL-LINE ROLE — running backs who get goal-line carries and receivers/TEs who are red-zone targets score most anytime TDs. Recent TD rate (TD/g) and touch volume (touch/g, tgt/g) are the best proxies; weight recent usage heavily.
-(3) OPPONENT DEFENSE — a defense allowing many rushing TDs makes opposing RBs strong plays; one giving up passing TDs lifts WR/TE. Higher points-allowed = softer defense.
-(4) GAME SCRIPT from the spread — a heavy favorite (negative spread) tends to run near the goal line late → boosts its RBs; a big underdog throws → boosts its pass-catchers in garbage time.
-(5) VOLUME — high touches/targets per game means more scoring chances; a workhorse RB or target-hog WR beats a committee player.
+(3) OPPONENT DEFENSE — a defense allowing many rushing TDs makes opposing RBs strong plays; one giving up passing TDs lifts WR/TE. Higher points-allowed = softer defense. KEY DEF INJURIES listed for a defense (e.g. a starting CB or LB out) further softens that unit against the position group that player defends — a missing starting CB/S boosts opposing WR/TE plays, a missing starting LB/DL boosts opposing RB plays.
+(4) GAME SCRIPT from the spread — a heavy favorite (negative spread) tends to run near the goal line late → boosts its RBs; a big underdog throws → boosts its pass-catchers in garbage time. Cross-reference with each team's own O-LEAN (rush% vs pass%) — a run-heavy team favored AND facing a defense that's soft against the run is a stacked signal; a pass-heavy team as a big underdog against a pass-funnel defense likewise stacks for its WR/TE.
+(5) WEATHER, when present — wind above ~15mph and/or high precipitation probability suppresses passing efficiency and long/contested-catch TDs, and tends to push offenses toward the run game. In windy/wet games, shade probability toward RBs and away from deep-target WRs. No weather line means either an indoor game or unknown conditions — do not assume either way.
+(6) VOLUME — high touches/targets per game means more scoring chances; a workhorse RB or target-hog WR beats a committee player.
 
 Realistic: even the best anytime-TD play is ~55-70% likely; most good plays are 35-55%. Do NOT inflate. Spread td_score 0-100 honestly.
 
@@ -229,7 +234,6 @@ export default async function handler(req, res) {
     if (clean.length >= 6 && kept.length < Math.max(3, Math.floor(clean.length/3))) { note = ` (name-match kept ${kept.length}/${clean.length}; showing all)`; kept = clean; }
     else if (!kept.length && clean.length) kept = clean;
 
-    // Authoritative override: correct team + opponent from the real rosters.
     const truthFor = (c) => {
       const n = normName(c.name);
       if (truthByPlayer[n]) return truthByPlayer[n];
@@ -257,7 +261,6 @@ export default async function handler(req, res) {
 
   let lastMsg = "";
 
-  // Provider 1: Gemini flash-lite first (reliable, full slate, 1M context).
   if (GEMINI_KEY && timeLeft() > 15000) {
     const prompt = buildPrompt(blocks);
     for (const model of ["gemini-2.5-flash-lite", "gemini-2.5-flash"]) {
@@ -268,7 +271,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Provider 2: OpenRouter (tight timeout so it can't starve Cerebras).
   if (OPENROUTER_KEY && timeLeft() > 20000) {
     const prompt = buildPrompt(blocks);
     const r = await callOpenRouter("meta-llama/llama-3.3-70b-instruct:free", prompt, OPENROUTER_KEY, Math.min(10000, timeLeft() - 20000));
@@ -276,7 +278,6 @@ export default async function handler(req, res) {
     lastMsg = r.msg;
   }
 
-  // Provider 3: Cerebras (last resort, chunked for its small context).
   if (CEREBRAS_KEY && timeLeft() > 12000) {
     const allChunks = chunkForCerebras(blocks);
     const chunks = allChunks.slice(0, 16);
