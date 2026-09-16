@@ -29,11 +29,17 @@ async function teamSkillPlayers(teamId, msLeft) {
     const d = await r.json();
     const out = [];
     for (const group of d.athletes || []) {
-      // roster groups are keyed by position category (offense/defense/...).
+      // roster groups are keyed by position category. Only take the offense
+      // group's skill players (defense/specialTeam groups won't have RB/WR/TE
+      // but we filter by position anyway).
       for (const a of group.items || []) {
         const pos = a.position?.abbreviation || "";
         if (!SKILL.has(pos)) continue;
-        if (a.status && a.status.type && a.status.type !== "active") continue;
+        // Only exclude players we can clearly tell are OUT (IR/suspended group,
+        // or an explicit inactive status). Do NOT drop on an unrecognized status
+        // shape — that was emptying whole rosters.
+        const grp = (group.position || "").toLowerCase();
+        if (grp.includes("injured") || grp.includes("suspended") || grp.includes("practice")) continue;
         out.push({
           id: a.id,
           name: a.displayName || a.fullName || "?",
@@ -149,17 +155,26 @@ export default async function handler(req, res) {
   body = body || {};
   const src = (k) => body[k] ?? req.query[k];
 
-  const away_team_id = src("away_team_id"), home_team_id = src("home_team_id");
-  const away_team = src("away_team"), home_team = src("home_team");
+  let away_team_id = src("away_team_id"), home_team_id = src("home_team_id");
+  let away_team = src("away_team"), home_team = src("home_team");
+  // Browser-testable default (DEN@KC from the diagnostic): visit /api/gamedata
+  // with no params to sanity-check the pipeline.
+  if (!away_team_id && !home_team_id) {
+    away_team_id = "7"; home_team_id = "12"; away_team = "DEN"; home_team = "KC";
+  }
 
   try {
-    const results = { players: { away: [], home: [] }, defense: {}, ok: true };
+    const results = { players: { away: [], home: [] }, defense: {}, ok: true,
+      debug: { away_team_id: away_team_id||null, home_team_id: home_team_id||null } };
 
     // Rosters first (fast, and everything else hangs off them).
     const [awayPlayers, homePlayers] = await Promise.all([
       teamSkillPlayers(away_team_id, msLeft),
       teamSkillPlayers(home_team_id, msLeft)
     ]);
+    results.debug.rosterAway = awayPlayers.length;
+    results.debug.rosterHome = homePlayers.length;
+    results.debug.sampleNames = [...awayPlayers.slice(0,2), ...homePlayers.slice(0,2)].map(p => p.name);
 
     // Opponent defense (away players face home defense and vice-versa).
     const [awayDef, homeDef] = await Promise.all([
@@ -174,15 +189,14 @@ export default async function handler(req, res) {
     const enrich = async (players) => {
       const top = players.slice(0, 8); // ~RB1-2, WR1-3, TE1-2
       await Promise.all(top.map(async (p) => {
-        const rec = await playerRecent(p.id, msLeft);
-        if (rec) Object.assign(p, rec);
+        try { const rec = await playerRecent(p.id, msLeft); if (rec) Object.assign(p, rec); } catch {}
       }));
-      // Keep only players with some recent usage OR a clear role (top of list).
       return top;
     };
 
     results.players.away = await enrich(awayPlayers);
     results.players.home = await enrich(homePlayers);
+    results.debug.enrichedWithStats = [...results.players.away, ...results.players.home].filter(p => p.td_rate != null).length;
 
     return res.status(200).json(results);
   } catch (e) {
