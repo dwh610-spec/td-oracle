@@ -1,8 +1,10 @@
 // pages/api/gamedata.js
 // Per-game NFL data for TD prediction. For one matchup, pulls each team's
-// skill-position players (RB/WR/TE) from the roster, their recent usage + TD
-// production from the gamelog, and the opponent's scoring defense. All from
-// ESPN's free endpoints. Called once per game by the frontend (POST).
+// skill-position players (RB/WR/TE) from the roster, excludes anyone
+// currently Out/IR/PUP/Suspended (real injuries endpoint, not the roster
+// group heuristic), their recent usage + TD production from the gamelog,
+// and the opponent's scoring defense. All from ESPN's free endpoints.
+// Called once per game by the frontend (POST).
 
 export const config = { maxDuration: 60 };
 
@@ -21,6 +23,62 @@ async function fetchT(url, ms = 7000) {
 // Skill positions that score the vast majority of non-QB TDs.
 const SKILL = new Set(["RB", "WR", "TE", "FB"]);
 
+// Statuses that mean "will not play." Questionable/Probable stay eligible —
+// they play more often than not. Everything here is a near-certain scratch.
+const OUT_LIKE = /\bout\b|injured reserve|\bir\b|\bpup\b|suspend|non-football|did not report|doubtful/i;
+
+// Real injury designations live on a SEPARATE endpoint from the roster —
+// site.api.espn.com's roster response does NOT reliably carry status, so the
+// old approach (checking roster group names for "injured"/"suspended") was
+// checking the wrong place and effectively never fired. This hits the actual
+// injuries endpoint and resolves however many $ref entries it returns (core
+// API list endpoints are usually ref-only), bounded and parallel so a slow
+// resolve can't eat the whole time budget.
+async function teamInjuredIds(teamId, msLeft) {
+  const out = new Set();
+  if (!teamId || msLeft() < 5000) return out;
+  try {
+    const r = await fetchT(`${CORE}/teams/${teamId}/injuries`, 6000);
+    if (!r.ok) return out;
+    const d = await r.json();
+    const items = d.items || [];
+    if (!items.length) return out;
+
+    const resolveOne = async (item) => {
+      try {
+        let obj = item;
+        if (item?.$ref && !item.status && !item.athlete) {
+          const rr = await fetchT(item.$ref, 4000);
+          if (!rr.ok) return;
+          obj = await rr.json();
+        }
+        const statusText = (
+          (typeof obj.status === "string" ? obj.status : null) ||
+          obj.status?.type?.name || obj.status?.name ||
+          obj.type?.name || obj.details?.type || ""
+        );
+        if (!statusText || !OUT_LIKE.test(statusText)) return;
+
+        let athleteId = obj.athlete?.id || obj.athleteId || null;
+        if (!athleteId && obj.athlete?.$ref) {
+          const m = String(obj.athlete.$ref).match(/athletes\/(\d+)/);
+          if (m) athleteId = m[1];
+        }
+        if (!athleteId && obj.$ref) {
+          const m = String(obj.$ref).match(/athletes\/(\d+)/);
+          if (m) athleteId = m[1];
+        }
+        if (athleteId) out.add(String(athleteId));
+      } catch {}
+    };
+
+    // Bounded: a team's injury list is normally short (a handful of players),
+    // but cap it defensively so a bloated response can't stall the request.
+    await Promise.all(items.slice(0, 20).map(resolveOne));
+  } catch {}
+  return out;
+}
+
 // Pull a team's skill-position players from the roster endpoint.
 async function teamSkillPlayers(teamId, msLeft) {
   if (!teamId || msLeft() < 6000) return [];
@@ -29,15 +87,9 @@ async function teamSkillPlayers(teamId, msLeft) {
     const d = await r.json();
     const out = [];
     for (const group of d.athletes || []) {
-      // roster groups are keyed by position category. Only take the offense
-      // group's skill players (defense/specialTeam groups won't have RB/WR/TE
-      // but we filter by position anyway).
       for (const a of group.items || []) {
         const pos = a.position?.abbreviation || "";
         if (!SKILL.has(pos)) continue;
-        // Only exclude players we can clearly tell are OUT (IR/suspended group,
-        // or an explicit inactive status). Do NOT drop on an unrecognized status
-        // shape — that was emptying whole rosters.
         const grp = (group.position || "").toLowerCase();
         if (grp.includes("injured") || grp.includes("suspended") || grp.includes("practice")) continue;
         out.push({
@@ -60,6 +112,14 @@ async function teamSkillPlayers(teamId, msLeft) {
 //                          Season", "Projected", and "Career".
 // We read the Regular Season split (current form); if it's all zeros/empty
 // (early in the year), fall back to Career as a role/usage baseline.
+//
+// Rate math: the Regular Season split is a season-to-date TOTAL, not a full
+// season. Dividing by a fixed 17 early in the year drastically understates
+// anyone who's had one big game so far (e.g. 2 TDs / 17 = 0.12, when the real
+// current rate is 2.0/game). We look for a "gamesPlayed" stat in names[] and
+// use that as the real denominator; if ESPN doesn't expose it in this split,
+// we fall back to the fixed-17 estimate and flag it in stat_basis so this is
+// visible/checkable rather than silently wrong.
 async function playerRecent(athleteId, msLeft) {
   if (!athleteId || msLeft() < 5000) return null;
   const WEBB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
@@ -77,11 +137,12 @@ async function playerRecent(athleteId, msLeft) {
     const iRecTD  = idx("receivingTouchdowns");
     const iCar    = idx("rushingAttempts");
     const iRec    = idx("receptions");
+    const iGP     = idx("gamesPlayed");
 
     const readSplit = (sp) => {
       const arr = sp?.stats || [];
       const num = (i) => (i>=0 && arr[i]!=null) ? (parseFloat(String(arr[i]).replace(/[^0-9.\-]/g,""))||0) : 0;
-      return { rushTD:num(iRushTD), recTD:num(iRecTD), carries:num(iCar), rec:num(iRec) };
+      return { rushTD:num(iRushTD), recTD:num(iRecTD), carries:num(iCar), rec:num(iRec), gp:num(iGP) };
     };
 
     const findSplit = (nameWants) => splits.find(s => nameWants.some(w => (s.displayName||"").toLowerCase().includes(w)));
@@ -98,18 +159,32 @@ async function playerRecent(athleteId, msLeft) {
     if (!v.carries && !v.rec && !v.rushTD && !v.recTD) return null;
 
     const totalTD = v.rushTD + v.recTD;
-    // Per-game basis: Regular Season is this year's games; Career spans seasons,
-    // so for the career fallback we normalize per 17-game season for a rate.
-    const basis = src === "career baseline" ? Math.max(1, Math.round((v.carries + v.rec) / 20)) * 17 : 17;
-    const perG = (n) => +(n / (src === "career baseline" ? basis : 17)).toFixed(2);
+
+    let gamesForRate, statBasis;
+    if (src === "career baseline") {
+      // Normalize career totals to a per-17-game-season rate, same as before.
+      gamesForRate = Math.max(1, Math.round((v.carries + v.rec) / 20)) * 17;
+      statBasis = "career, normalized to 17-game season";
+    } else if (iGP >= 0 && v.gp > 0) {
+      // Real games-played from ESPN — the accurate denominator.
+      gamesForRate = v.gp;
+      statBasis = "regular season / actual games played";
+    } else {
+      // ESPN didn't expose gamesPlayed in this split — fall back to the old
+      // fixed-17 estimate. This will understate early-season hot starts;
+      // flagged here so it's visible if this path is still firing later.
+      gamesForRate = 17;
+      statBasis = "regular season / 17-game estimate (gamesPlayed not found)";
+    }
 
     return {
       stat_source: src,
+      stat_basis: statBasis,
       total_tds: totalTD,
       carries: v.carries,
       receptions: v.rec,
-      td_rate: perG(totalTD),
-      touches_pg: +((v.carries + v.rec) / (src === "career baseline" ? basis : 17)).toFixed(1)
+      td_rate: +(totalTD / gamesForRate).toFixed(2),
+      touches_pg: +((v.carries + v.rec) / gamesForRate).toFixed(1)
     };
   } catch { return null; }
 }
@@ -120,7 +195,6 @@ async function playerRecent(athleteId, msLeft) {
 async function teamDefense(teamId, msLeft) {
   const o = {};
   if (!teamId || msLeft() < 5000) return o;
-  const CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
   const year = new Date().getFullYear();
   const tryYear = async (yr) => {
     try {
@@ -167,20 +241,28 @@ export default async function handler(req, res) {
     const results = { players: { away: [], home: [] }, defense: {}, ok: true,
       debug: { away_team_id: away_team_id||null, home_team_id: home_team_id||null } };
 
-    // Rosters first (fast, and everything else hangs off them).
-    const [awayPlayers, homePlayers] = await Promise.all([
+    // Roster + injuries + defense all fire in parallel — independent calls.
+    const [awayPlayersRaw, homePlayersRaw, awayInjured, homeInjured, awayDef, homeDef] = await Promise.all([
       teamSkillPlayers(away_team_id, msLeft),
-      teamSkillPlayers(home_team_id, msLeft)
-    ]);
-    results.debug.rosterAway = awayPlayers.length;
-    results.debug.rosterHome = homePlayers.length;
-    results.debug.sampleNames = [...awayPlayers.slice(0,2), ...homePlayers.slice(0,2)].map(p => p.name);
-
-    // Opponent defense (away players face home defense and vice-versa).
-    const [awayDef, homeDef] = await Promise.all([
+      teamSkillPlayers(home_team_id, msLeft),
+      teamInjuredIds(away_team_id, msLeft),
+      teamInjuredIds(home_team_id, msLeft),
       teamDefense(away_team_id, msLeft),
       teamDefense(home_team_id, msLeft)
     ]);
+
+    // Filter out anyone confirmed Out/IR/PUP/Suspended BEFORE picking the
+    // top-8 depth-chart slice, so a healthy backup takes the roster spot
+    // instead of the slot being wasted on someone who can't play.
+    const awayPlayers = awayPlayersRaw.filter(p => !awayInjured.has(String(p.id)));
+    const homePlayers = homePlayersRaw.filter(p => !homeInjured.has(String(p.id)));
+
+    results.debug.rosterAway = awayPlayers.length;
+    results.debug.rosterHome = homePlayers.length;
+    results.debug.injuredExcludedAway = awayPlayersRaw.length - awayPlayers.length;
+    results.debug.injuredExcludedHome = homePlayersRaw.length - homePlayers.length;
+    results.debug.sampleNames = [...awayPlayers.slice(0,2), ...homePlayers.slice(0,2)].map(p => p.name);
+
     results.defense = { away: awayDef, home: homeDef };
 
     // Enrich each player with recent usage — but cap how many we hit per team
